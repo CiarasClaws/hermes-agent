@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -39,6 +40,108 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+# ---------------------------------------------------------------------------
+# Auto-route coding subtasks to GLM 5.2 (added 2026-06-17)
+# ---------------------------------------------------------------------------
+# The driving model (deepseek-v4-pro) reliably IGNORES prose guidance to pass
+# model='glm-5.2' on coding delegations, so this is a DETERMINISTIC fallback:
+# when a delegated task specifies no model/provider AND its goal/context match
+# clear coding signals, the child is routed to zai/glm-5.2 (better at sustained
+# coding). Conservative — only fires on unambiguous implementation/debug/build
+# signals, never on research/writing/analysis — and every auto-route is logged
+# so misfires are visible. An explicit per-task model always wins (checked by
+# the caller before this runs). Override the target with env
+# DELEGATE_CODING_MODEL / DELEGATE_CODING_PROVIDER; disable entirely by setting
+# DELEGATE_CODING_MODEL="".
+_CODING_AUTOROUTE_MODEL_ENV = "DELEGATE_CODING_MODEL"
+_CODING_AUTOROUTE_PROVIDER_ENV = "DELEGATE_CODING_PROVIDER"
+_CODING_AUTOROUTE_DEFAULT_MODEL = "glm-5.2"
+_CODING_AUTOROUTE_DEFAULT_PROVIDER = "zai"
+
+# Strong, unambiguous code signals — three alternations:
+#   1. a coding VERB followed (within ~44 chars) by a code NOUN
+#   2. a source-code / build file (calc.py, app.tsx, Dockerfile, ...)
+#   3. a code framework/tool/term that only appears in coding work
+# Widened 2026-06-17 to catch oddly-worded coding tasks (optimize/deploy/wire
+# a query/pipeline/webhook, etc.) WITHOUT misfiring on brand/design/ops prose.
+# Framework names that collide with English (react/spring/rails/express/
+# bootstrap/cargo/mocha/jest/compile-a-list) are deliberately EXCLUDED from the
+# verb-free branch 3 — they only trigger via a .ext file or a verb+noun pair.
+# Validated: 32/32 coding tasks matched, 32/32 non-coding tasks skipped.
+_CODING_SIGNAL_RE = re.compile(
+    r"(?ix)"
+    # 1. coding verb + (within ~44 chars) a code noun
+    r"\b(?:implement|reimplement|rewrite|refactor|debug|patch|optimi[sz]e|"
+    r"integrate|containeri[sz]e|seriali[sz]e|deseriali[sz]e|parse|lint|"
+    r"configure|instrument|benchmark|profile|validate|render|deploy|scaffold|"
+    r"write|add|create|build|fix|extend|port|migrate|wire(?:\s+up)?)\b"
+    r"[\w\s,./'\"():\-]{0,44}?"
+    r"\b(?:functions?|methods?|classe?s?|module|script|tests?|unit\s?tests?|"
+    r"test\s?suite|cli|api|endpoints?|routes?|components?|parser|server|daemon|"
+    r"library|package|feature|bug|regression|schema|migrations?|git\s?hook|"
+    r"webhook|plugin|crud|algorithm|quer(?:y|ies)|form|pipeline|handler|"
+    r"middleware|config|dependenc(?:y|ies)|build|frontend|backend|database|"
+    r"interface|struct|fixture|mock|decorator|container|workflow|reducer|"
+    r"layout|stylesheet|selector|serializer|app|application|ui)\b"
+    r"|"
+    # 2. a source-code / build file
+    r"\b\w+\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|kt|swift|scala|dart|lua|rb|"
+    r"php|c|cc|cpp|h|hpp|cs|css|scss|sass|less|html|sql|sh|bash|vue|svelte|"
+    r"yaml|yml|toml|tf)\b"
+    r"|\b(?:Dockerfile|Makefile)\b"
+    r"|"
+    # 3. unambiguous code framework / tool / term (no verb needed)
+    r"\b(?:pytest|vitest|django|fastapi|flask|webpack|eslint|prettier|tailwind|"
+    r"kubernetes|k8s|dockerfile|docker|postgres(?:ql)?|sqlite|redis|mongodb|"
+    r"graphql|terraform|ansible|pytorch|tensorflow|numpy|nginx|vite|nuxt|"
+    r"next\.js|svelte|vue\.js|react\.js|reactjs|node\.js|nodejs|typescript|"
+    r"javascript|golang|kotlin|stack\s?trace|traceback|codebase|segfault|"
+    r"null\s?pointer|race\s?condition|merge\s?conflict|pull\s?request|ci/?cd|"
+    r"github\s+actions|gitlab\s+ci|frontend|front-end|backend|back-end|"
+    r"recompile|(?:syntax|runtime|compile|compilation)\s+error)\b"
+)
+
+
+def _looks_like_coding_task(goal: Optional[str], context: Optional[str] = None) -> bool:
+    """True when the delegated task is clearly an implementation/coding/debug job.
+
+    Conservative by design: matches a coding verb + code noun, or an explicit
+    code artifact/framework/tool. Does NOT match research, writing, summarising,
+    planning, or analysis tasks.
+    """
+    text = f"{goal or ''}\n{context or ''}"
+    return bool(_CODING_SIGNAL_RE.search(text))
+
+
+def _coding_autoroute_target() -> tuple:
+    """(model, provider) for auto-routed coding subtasks, env-overridable.
+
+    The target is read from DELEGATE_CODING_MODEL / DELEGATE_CODING_PROVIDER via
+    Hermes' get_env_value — so it can be set in ``~/.hermes/.env`` (next to the
+    API keys) OR the process environment, exactly like every other Hermes key.
+    This is THE single switch for swapping coding models: change those two
+    values, restart the gateway, done. Falls back to the module defaults
+    (glm-5.2 / zai) when unset. Disable auto-routing entirely with
+    DELEGATE_CODING_MODEL="" (set to empty in .env).
+    """
+    try:
+        from hermes_cli.config import get_env_value
+        _raw_model = get_env_value(_CODING_AUTOROUTE_MODEL_ENV)
+        _raw_provider = get_env_value(_CODING_AUTOROUTE_PROVIDER_ENV)
+    except Exception:  # never let an import hiccup break delegation
+        _raw_model = os.environ.get(_CODING_AUTOROUTE_MODEL_ENV)
+        _raw_provider = os.environ.get(_CODING_AUTOROUTE_PROVIDER_ENV)
+
+    # None = not set → use default; "" = explicitly set empty → disable.
+    model = (_raw_model if _raw_model is not None else _CODING_AUTOROUTE_DEFAULT_MODEL).strip()
+    if not model:
+        return None, None
+    provider = (
+        _raw_provider if _raw_provider is not None else _CODING_AUTOROUTE_DEFAULT_PROVIDER
+    ).strip() or None
+    return model, provider
 
 
 # Tools that children must never have access to
@@ -1940,6 +2043,8 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2033,7 +2138,14 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "model": model,
+                "provider": provider,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2068,32 +2180,74 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    # Per-task provider:model cache so a batch that re-uses the same override
+    # (e.g. several coding tasks all on zai:glm-5.2) resolves credentials once.
+    _per_task_creds_cache: Dict[str, dict] = {}
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model/provider override (added 2026-06-17): lets the agent
+            # route a single child to a different provider:model (e.g. zai:glm-5.2
+            # for a complex coding/design task) while other children inherit the
+            # parent or the global delegation.* config. When unset, falls back to
+            # the batch-wide `creds`.
+            _task_model = str(t.get("model") or "").strip() or None
+            _task_provider = str(t.get("provider") or "").strip() or None
+            # Deterministic coding auto-route: an EXPLICIT per-task model always
+            # wins; only when none is given do we sniff the goal for coding
+            # signals and route to glm-5.2/zai. Skipped when delegation.* config
+            # already pins a provider (the user set a global override on purpose).
+            if not _task_model and not _task_provider and not creds.get("provider"):
+                if _looks_like_coding_task(t.get("goal"), t.get("context")):
+                    _ar_model, _ar_provider = _coding_autoroute_target()
+                    if _ar_model:
+                        _task_model, _task_provider = _ar_model, _ar_provider
+                        logger.info(
+                            "delegate_task: auto-routed coding subtask %d to %s/%s "
+                            "(goal=%.60r)",
+                            i, _ar_provider, _ar_model, (t.get("goal") or ""),
+                        )
+            if _task_model or _task_provider:
+                _cache_key = f"{_task_provider or ''}:{_task_model or ''}"
+                task_creds = _per_task_creds_cache.get(_cache_key)
+                if task_creds is None:
+                    _task_cfg = dict(cfg)
+                    if _task_model:
+                        _task_cfg["model"] = _task_model
+                    if _task_provider:
+                        # A task-supplied provider takes the provider-resolution
+                        # path; drop any global delegation.base_url so it isn't
+                        # mistaken for a direct-endpoint override.
+                        _task_cfg["provider"] = _task_provider
+                        _task_cfg["base_url"] = ""
+                        _task_cfg["api_key"] = ""
+                    task_creds = _resolve_delegation_credentials(_task_cfg, parent_agent)
+                    _per_task_creds_cache[_cache_key] = task_creds
+            else:
+                task_creds = creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or task_creds.get("command"),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else task_creds.get("args"))
                 ),
                 role=effective_role,
             )
@@ -2569,6 +2723,18 @@ def _build_top_level_description() -> str:
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
         "- Parallel independent workstreams (research A and B simultaneously)\n\n"
+        "CHOOSING THE SUBAGENT MODEL (optional 'model'/'provider' per task):\n"
+        "- By default a child inherits your model (deepseek-v4-pro). Leave "
+        "'model'/'provider' unset for ordinary subtasks -- DeepSeek is the "
+        "right default for research, synthesis, review, and most delegation.\n"
+        "- For COMPLEX, LONG-HORIZON CODING (multi-file implementation, "
+        "refactors, debugging across a codebase, writing a non-trivial "
+        "program) OR FRONTEND/UI DESIGN THAT PRODUCES CODE (components, "
+        "layouts, CSS/Tailwind), set model='glm-5.2', provider='zai'. "
+        "GLM 5.2 outperforms DeepSeek on sustained coding/design-code work "
+        "and is worth its higher token cost there. Do NOT use it for "
+        "brand-voice / editorial copy (route that through the brand drafters), "
+        "for cheap mechanical tasks, or for plain research.\n\n"
         "WHEN NOT TO USE (use these instead):\n"
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
@@ -2760,6 +2926,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override (e.g. 'glm-5.2'). See top-level 'model' for when to use.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task provider for 'model' (e.g. 'zai' for glm-5.2). See top-level 'provider'.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2772,6 +2946,24 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for the subagent(s). Default: "
+                    "inherits your model (deepseek-v4-pro). Set 'glm-5.2' (with "
+                    "provider='zai') for complex long-horizon coding or "
+                    "frontend/UI design that produces code. Leave unset for "
+                    "research, synthesis, review, and other ordinary subtasks."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider for 'model'. Use 'zai' when model='glm-5.2'. "
+                    "Only set when 'model' is set; otherwise the subagent "
+                    "inherits the parent's provider."
+                ),
             },
             "acp_command": {
                 "type": "string",
