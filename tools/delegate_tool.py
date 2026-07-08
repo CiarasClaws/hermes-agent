@@ -76,7 +76,9 @@ _CODING_SIGNAL_RE = re.compile(
     r"\b(?:implement|reimplement|rewrite|refactor|debug|patch|optimi[sz]e|"
     r"integrate|containeri[sz]e|seriali[sz]e|deseriali[sz]e|parse|lint|"
     r"configure|instrument|benchmark|profile|validate|render|deploy|scaffold|"
-    r"write|add|create|build|fix|extend|port|migrate|wire(?:\s+up)?)\b"
+    r"write|add|create|build|fix|extend|port|migrate|wire(?:\s+up)?|"
+    r"design|redesign|restyle|revamp|reskin|polish|theme|lay\s?out|"
+    r"mock\s?up|prototype|style)\b"
     r"[\w\s,./'\"():\-]{0,44}?"
     r"\b(?:functions?|methods?|classe?s?|module|script|tests?|unit\s?tests?|"
     r"test\s?suite|cli|api|endpoints?|routes?|components?|parser|server|daemon|"
@@ -84,12 +86,16 @@ _CODING_SIGNAL_RE = re.compile(
     r"webhook|plugin|crud|algorithm|quer(?:y|ies)|form|pipeline|handler|"
     r"middleware|config|dependenc(?:y|ies)|build|frontend|backend|database|"
     r"interface|struct|fixture|mock|decorator|container|workflow|reducer|"
-    r"layout|stylesheet|selector|serializer|app|application|ui)\b"
+    r"layout|stylesheet|selector|serializer|app|application|ui|"
+    r"theme|template|hero|header|footer|menu|sidebar|nav(?:bar|igation)?|"
+    r"modal|drawer|card|button|"
+    r"icon|banner|section|page|screen|view|breakpoint|animation|"
+    r"transition|responsive|storefront|typography|palette|styling)\b"
     r"|"
     # 2. a source-code / build file
     r"\b\w+\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|kt|swift|scala|dart|lua|rb|"
     r"php|c|cc|cpp|h|hpp|cs|css|scss|sass|less|html|sql|sh|bash|vue|svelte|"
-    r"yaml|yml|toml|tf)\b"
+    r"yaml|yml|toml|tf|liquid)\b"
     r"|\b(?:Dockerfile|Makefile)\b"
     r"|"
     # 3. unambiguous code framework / tool / term (no verb needed)
@@ -100,6 +106,7 @@ _CODING_SIGNAL_RE = re.compile(
     r"javascript|golang|kotlin|stack\s?trace|traceback|codebase|segfault|"
     r"null\s?pointer|race\s?condition|merge\s?conflict|pull\s?request|ci/?cd|"
     r"github\s+actions|gitlab\s+ci|frontend|front-end|backend|back-end|"
+    r"shopify|liquid|theme\s?check|theme\s?kit|storefront|framer|"
     r"recompile|(?:syntax|runtime|compile|compilation)\s+error)\b"
 )
 
@@ -113,6 +120,28 @@ def _looks_like_coding_task(goal: Optional[str], context: Optional[str] = None) 
     """
     text = f"{goal or ''}\n{context or ''}"
     return bool(_CODING_SIGNAL_RE.search(text))
+
+
+# A deterministic OPT-OUT from the coding auto-route: when the delegated goal
+# explicitly asks to run on the main model (deepseek), honour it and skip the
+# glm-5.2 auto-route. This is the reliable, per-task "switch back to deepseek"
+# Hermes can flip in natural language — deepseek won't reliably self-pass a
+# structured model param (the same reason the coding auto-route is a regex).
+_MAIN_MODEL_OVERRIDE_RE = re.compile(
+    r"(?ix)"
+    r"\b(?:use|on|keep|stay(?:\s+on)?|with|via|prefer|run\s+on|route\s+to)\s+"
+    r"deep\s?seek\b"
+    r"|\[\s*model\s*[:=]\s*deep\s?seek[\w.\-]*\s*\]"
+    r"|\b(?:no|not|avoid|skip|without|don'?t\s+use)\s+glm\b"
+)
+
+
+def _prefers_main_model(goal: Optional[str], context: Optional[str] = None) -> bool:
+    """True when the goal explicitly asks to run on the main model (deepseek) —
+    e.g. 'use deepseek', '[model:deepseek]', 'no glm'. Lets Hermes flip one task
+    back off the glm-5.2 coding auto-route without a structured model param."""
+    text = f"{goal or ''}\n{context or ''}"
+    return bool(_MAIN_MODEL_OVERRIDE_RE.search(text))
 
 
 def _coding_autoroute_target() -> tuple:
@@ -2201,7 +2230,15 @@ def delegate_task(
             # signals and route to glm-5.2/zai. Skipped when delegation.* config
             # already pins a provider (the user set a global override on purpose).
             if not _task_model and not _task_provider and not creds.get("provider"):
-                if _looks_like_coding_task(t.get("goal"), t.get("context")):
+                if _prefers_main_model(t.get("goal"), t.get("context")):
+                    # Explicit "use deepseek / no glm" opt-out → keep the main
+                    # model (deepseek); do NOT apply the glm-5.2 coding auto-route.
+                    logger.info(
+                        "delegate_task: main-model override on subtask %d "
+                        "(goal=%.60r) — skipping coding auto-route",
+                        i, (t.get("goal") or ""),
+                    )
+                elif _looks_like_coding_task(t.get("goal"), t.get("context")):
                     _ar_model, _ar_provider = _coding_autoroute_target()
                     if _ar_model:
                         _task_model, _task_provider = _ar_model, _ar_provider
