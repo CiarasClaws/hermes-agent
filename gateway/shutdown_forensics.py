@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -226,17 +227,53 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
+    # Platform-specific probes.  The Linux branch is the original; the BSD
+    # branch exists because macOS ships neither GNU ps (no `f` / `--sort`)
+    # nor pstree, /proc, dmesg-without-sudo or journalctl — every command in
+    # the Linux script fails there, which is how this diagnostic silently
+    # produced a 0-byte log on macOS for months.
+    if sys.platform == "darwin":
+        # BSD ps: -r sorts by CPU. Dump the FULL table, not a top-N slice: the
+        # process we're hunting (e.g. a `launchctl kickstart -k` that is still
+        # blocked waiting for us to exit) burns no CPU and would be cut off.
+        # cut keeps a few pathological command lines (agent shell wrappers run
+        # to several KB) from bloating the log; 220 cols still shows a full
+        # `launchctl kickstart -k gui/<uid>/<label>`, and the grep section
+        # above records any service-manager client untruncated anyway.
+        ps_cmd = (
+            "ps -Ao pid,ppid,pgid,user,pcpu,etime,command -r 2>/dev/null "
+            "| cut -c1-220"
+        )
+        # No pstree — walk our own ancestor chain with a small ps loop.
+        tree_cmd = (
+            f"p={os.getpid()}; for _ in 1 2 3 4 5 6 7 8; do "
+            'case "$p" in ""|0) break;; esac; '
+            'ps -o pid=,ppid=,command= -p "$p" 2>/dev/null || break; '
+            'p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); done'
+        )
+        load_cmd = "uptime 2>/dev/null || true"
+        # dmesg needs sudo on macOS and there is no journalctl; skip rather
+        # than emit a usage error into the diagnostic.
+        kernel_cmd = "true"
+    else:
+        ps_cmd = "ps auxf --sort=-pcpu 2>/dev/null | head -60"
+        tree_cmd = f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true"
+        load_cmd = "cat /proc/loadavg 2>/dev/null || true"
+        kernel_cmd = (
+            "dmesg -T 2>/dev/null | tail -20 "
+            "|| journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true"
+        )
+
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
+        "echo '--- service-manager clients still running (likely killer) ---'; "
+        "ps -Ao pid,ppid,user,etime,command 2>/dev/null "
+        "| grep -Ei 'launchctl|systemctl|kickstart' | grep -v grep || true; "
+        f"echo '--- process table ---'; {ps_cmd}; "
+        f"echo '--- ancestor chain of self ---'; {tree_cmd}; "
+        f"echo '--- loadavg ---'; {load_cmd}; "
+        f"echo '--- kernel/journal (oom/killed) ---'; {kernel_cmd}; "
         "echo '=== end ==='"
     )
 
@@ -254,8 +291,23 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        # `timeout` is GNU coreutils — absent on a stock macOS, where the
+        # bare Popen below used to raise FileNotFoundError and abort the
+        # whole diagnostic. Use it when present, otherwise self-limit inside
+        # the shell so a wedged `ps` still can't linger.
+        _timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+        if _timeout_bin:
+            argv = [_timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+        else:
+            argv = [
+                "bash",
+                "-c",
+                f"(sleep {timeout_seconds:.0f}; kill $$ 2>/dev/null) & "
+                f"_wd=$!; {{ {script}; }}; kill $_wd 2>/dev/null",
+            ]
+
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            argv,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
