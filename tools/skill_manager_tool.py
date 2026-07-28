@@ -283,11 +283,22 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    # NOTE: iter_skill_index_files, not Path.rglob — rglob does NOT descend into
+    # symlinked directories, and a registered skill is a SYMLINK into its source
+    # repo. Using rglob here made every correctly-registered skill invisible to
+    # skill_manage (50 of them on this host: opa-plan-slip, morning-brief,
+    # retinue-counsel, life-mirror-nightly, the review skills...) while
+    # skill_view/skills_list — which already use this walker — saw them fine.
+    # The symptom was a silent "Skill 'X' not found in active profile 'default'".
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        is_excluded_skill_path,
+        iter_skill_index_files,
+    )
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
@@ -307,7 +318,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     matches: List[Tuple[str, Path]] = []
     try:
         from hermes_constants import get_default_hermes_root
-        from agent.skill_utils import is_excluded_skill_path
+        from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
     except Exception:
         return matches
 
@@ -350,7 +361,10 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         try:
-            for skill_md in skills_dir.rglob("SKILL.md"):
+            # symlink-following walker, same reason as _find_skill above —
+            # otherwise the cross-profile hint stays silent for exactly the
+            # skills most likely to be sitting in another profile.
+            for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
                 if is_excluded_skill_path(skill_md):
                     continue
                 if skill_md.parent.name == name:
