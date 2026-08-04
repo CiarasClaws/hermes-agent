@@ -2110,6 +2110,50 @@ def cmd_chat(args):
 
 def cmd_gateway(args):
     """Gateway management commands."""
+    # LOCAL PATCH (04/08/2026) — on-demand Python stack dump for the cron stall.
+    #
+    # `kill -USR1 <gateway pid>` makes faulthandler write every thread's PYTHON
+    # stack to stderr, which launchd routes to ~/.hermes/logs/gateway.error.log.
+    # gateway_stall_capture.sh sends that signal the moment a cron turn goes
+    # quiet, which is the only way to see WHICH PYTHON LINE is hung.
+    #
+    # Why this is needed: `/usr/bin/sample` gives NATIVE stacks, and during a
+    # confirmed stall they show the process looking idle — everything parked in
+    # __psynch_cvwait/kevent/poll, with ZERO threads in __read, read_nocancel,
+    # __recvfrom or __psynch_mutex_wait. That rules out blocked-on-socket and
+    # blocked-on-native-mutex, but cannot name the Python frame.
+    #
+    # It goes HERE, not in gateway/run.py, because the LaunchAgent runs
+    # `python -m hermes_cli.main gateway run` — registering in gateway/run.py's
+    # main() covers only the `python -m gateway.run` entrypoint, so SIGUSR1
+    # produced nothing (verified 04/08: log grew 237 bytes of startup warning
+    # and no stack). Register on the path that actually runs.
+    #
+    # ⚠ THE SIGNAL CHOICE IS LOAD-BEARING — do not "tidy" it to SIGUSR1/SIGUSR2.
+    #   SIGUSR1 is ALREADY the gateway's restart signal (gateway/run.py ~19561 ->
+    #     request_restart(via_service=True)). Registering faulthandler on it is
+    #     silently overridden, and SENDING it restarts the gateway — verified the
+    #     hard way on 04/08, when a test signal produced "Stopping gateway for
+    #     restart..." instead of a stack dump.
+    #   SIGUSR2 is free, but its DEFAULT ACTION IS TERMINATE. If this patch is
+    #     ever lost (it is a core file, so `hermes update` wipes it) the capture
+    #     script would then kill the gateway on every stall it detected.
+    #   SIGINFO's default action on macOS/BSD is to DISCARD. So if the handler is
+    #     missing, the signal is a no-op — the failure mode is "no diagnostics",
+    #     never "dead gateway". Measured 04/08: unhandled SIGINFO leaves the
+    #     process alive, unhandled SIGUSR2 kills it.
+    #
+    # faulthandler's handler is async-signal-safe (raw write(2), no allocation),
+    # so it cannot deadlock the interpreter we are trying to inspect, and it
+    # costs nothing until signalled.
+    try:
+        import faulthandler
+        import signal as _signal
+        if hasattr(_signal, "SIGINFO"):
+            faulthandler.register(_signal.SIGINFO, all_threads=True, chain=False)
+    except Exception:
+        pass  # diagnostics must never stop the gateway starting
+
     _sync_bundled_skills_quietly()
 
     from hermes_cli.gateway import gateway_command
