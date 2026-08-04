@@ -2665,6 +2665,32 @@ def run_conversation(
                     _error_summary,
                 )
 
+                # LOCAL PATCH (04/08/2026) — remember the FIRST failure on each
+                # provider so the cron layer can report the PRIMARY cause.
+                # Without this, only the LAST error survives to the user: on
+                # 04/08 nine Telegram messages said "HTTP 429: Insufficient
+                # balance" (the fallback's billing problem) while the actual
+                # fault was the primary stalling for 180s with no chunks. The
+                # message named a symptom of the rescue attempt, not the cause.
+                # Keyed by provider and first-write-wins, so retries 2 and 3 do
+                # not overwrite the original reason. Fully defensive: this is
+                # diagnostics, and must never be able to break the retry path.
+                try:
+                    _prov = (getattr(agent, "provider", "") or "").strip().lower()
+                    _hist = getattr(agent, "_hermes_failure_history", None)
+                    if _hist is None:
+                        _hist = []
+                        agent._hermes_failure_history = _hist
+                    if not any(h.get("provider") == _prov for h in _hist):
+                        _hist.append({
+                            "provider": _prov or "?",
+                            "model": str(getattr(agent, "model", "") or "?"),
+                            "error_type": error_type,
+                            "summary": str(_error_summary)[:300],
+                        })
+                except Exception:
+                    pass
+
                 _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")

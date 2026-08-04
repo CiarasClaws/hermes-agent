@@ -170,6 +170,76 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+# ── LOCAL PATCH (04/08/2026): repeat-failure suppression ───────────────────
+# See the call site in _process_job. State lives beside the cron jobs file.
+_CRON_FAILURE_STATE = "failure_notify_state.json"
+_CRON_FAILURE_QUIET_MINUTES = 120   # one reminder every 2h while still broken
+
+
+def _cron_failure_signature(error: str) -> str:
+    """Stable-ish fingerprint for 'the same failure again'.
+
+    Strips digits so timestamps, token counts, attempt numbers and elapsed
+    times don't make every occurrence look novel — otherwise the dedupe never
+    fires, which is the failure mode this whole patch exists to remove.
+    """
+    import hashlib
+    import re as _re
+    normalized = _re.sub(r"\d+", "#", (error or "").strip().lower())[:400]
+    return hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _cron_failure_should_deliver(job_id: str, error: str) -> tuple[bool, str]:
+    """Should this failure be delivered? Returns (deliver, note_to_append).
+
+    Contract:
+      * a NEW failure signature always delivers (never hide something new)
+      * the same signature stays quiet for _CRON_FAILURE_QUIET_MINUTES
+      * after that, one reminder that says how many were suppressed
+      * any error reading/writing state falls through to DELIVER — a broken
+        dedupe must never be able to silence a real alert
+    """
+    try:
+        import json as _json
+        lock_dir, _ = _get_lock_paths()
+        path = lock_dir / _CRON_FAILURE_STATE
+        try:
+            state = _json.loads(path.read_text())
+        except Exception:
+            state = {}
+
+        sig = _cron_failure_signature(error)
+        now = _hermes_now()
+        prev = state.get(job_id) or {}
+        note = ""
+        deliver = True
+
+        if prev.get("signature") == sig and prev.get("last_delivered"):
+            try:
+                from datetime import datetime as _dt
+                last = _dt.fromisoformat(prev["last_delivered"])
+                age_min = (now - last).total_seconds() / 60.0
+            except Exception:
+                age_min = _CRON_FAILURE_QUIET_MINUTES + 1
+            if age_min < _CRON_FAILURE_QUIET_MINUTES:
+                state[job_id] = {**prev, "suppressed": prev.get("suppressed", 0) + 1}
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_json.dumps(state, indent=2, sort_keys=True))
+                return False, (f"identical failure {prev.get('suppressed', 0) + 1}x, "
+                               f"quiet for {_CRON_FAILURE_QUIET_MINUTES - age_min:.0f} more min")
+            n = prev.get("suppressed", 0)
+            if n:
+                note = (f"(Still failing. {n} identical message"
+                        f"{'s' if n != 1 else ''} suppressed since the last one.)")
+
+        state[job_id] = {"signature": sig, "last_delivered": now.isoformat(), "suppressed": 0}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(state, indent=2, sort_keys=True))
+        return deliver, note
+    except Exception:
+        return True, ""
+
+
 @contextmanager
 def _job_profile_context(job_id: str, profile: Optional[str]):
     """Temporarily run a job under a specific Hermes profile.
@@ -1833,6 +1903,29 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
+
+        # LOCAL PATCH (04/08/2026) — name the PRIMARY failure, not just the last
+        # one. `e` is whatever the FINAL provider raised, so when the primary
+        # stalls and the fallback then refuses on billing, the user is told
+        # "HTTP 429: Insufficient balance" and nothing at all about the stall
+        # that started it. Nine such messages went out on 04/08 and every one of
+        # them pointed at the wrong provider. _hermes_failure_history is
+        # populated in agent/conversation_loop.py, first-write-wins per provider.
+        try:
+            _hist = getattr(agent, "_hermes_failure_history", None) or []
+            if len(_hist) > 1:
+                _chain = " -> ".join(
+                    f"{h['provider']}/{h['model']} ({h['error_type']}: {h['summary']})"
+                    for h in _hist
+                )
+                error_msg = (
+                    f"{error_msg}\n\nFailure chain (primary first):\n{_chain}\n"
+                    f"The first entry is the ROOT failure; later entries are "
+                    f"fallbacks that were tried because of it."
+                )
+        except Exception:
+            pass
+
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
         output = f"""# Cron Job: {job_name} (FAILED)
@@ -1982,10 +2075,34 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                # LOCAL PATCH (04/08/2026) — collapse repeat failures.
+                # A polling job on */20 that breaks at 13:00 delivers the SAME
+                # message every 20 minutes until its window closes; on 04/08
+                # that was nine identical Telegram messages for one incident.
+                # Repetition adds no information and trains her to ignore the
+                # channel, which is the real cost. First failure is delivered in
+                # full, then the same job+error stays quiet for a cooling
+                # period, then one "still failing" reminder per period. Recovery
+                # is always delivered (see _cron_failure_should_deliver).
+                if not success:
+                    _repeat_ok, _repeat_note = _cron_failure_should_deliver(
+                        job.get("id", ""), error or "")
+                    if not _repeat_ok:
+                        logger.info(
+                            "Job '%s': repeat failure suppressed (%s)",
+                            job.get("id", ""), _repeat_note,
+                        )
+                        should_deliver_failure = False
+                    else:
+                        should_deliver_failure = True
+                        if _repeat_note:
+                            deliver_content += f"\n\n{_repeat_note}"
+                else:
+                    should_deliver_failure = True
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
-                should_deliver = bool(deliver_content.strip())
+                should_deliver = bool(deliver_content.strip()) and should_deliver_failure
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
