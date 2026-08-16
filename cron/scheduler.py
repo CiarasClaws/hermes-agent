@@ -154,6 +154,16 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# LOCAL PATCH (16/08/2026) — hard ceiling on what one job may deliver.
+# The SILENT_MARKER guard is fail-open: it suppresses only on that exact
+# string, so any other output is delivered in full at any length.  On 16/08
+# a Daily Reset tick echoed its gate word as "[NO-BLOCK]" and then looped
+# 2,427 times — 264,583 chars delivered to Telegram, tripping flood control.
+# No guard can catch that by content, so bound it by length instead.
+# Sizing: across 1,509 cron runs in the preceding 7 days the largest
+# legitimate response was 7,049 chars, so 20k leaves ~3x headroom.
+_MAX_DELIVERY_CHARS = 20_000
+
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -2106,6 +2116,21 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+
+                # LOCAL PATCH (16/08/2026) — see _MAX_DELIVERY_CHARS.  Truncate,
+                # never drop: a capped delivery still tells her the job spoke, and
+                # the untruncated output is already saved by save_job_output above.
+                if should_deliver and len(deliver_content) > _MAX_DELIVERY_CHARS:
+                    _full_len = len(deliver_content)
+                    deliver_content = deliver_content[:_MAX_DELIVERY_CHARS] + (
+                        f"\n\n⚠️ [truncated: {_full_len:,} chars, capped at "
+                        f"{_MAX_DELIVERY_CHARS:,} — full output in "
+                        f"~/.hermes/cron/output/{job['id']}/]"
+                    )
+                    logger.warning(
+                        "Job '%s': response %d chars exceeds cap %d — truncated for delivery",
+                        job["id"], _full_len, _MAX_DELIVERY_CHARS,
+                    )
 
                 delivery_error = None
                 if should_deliver:
