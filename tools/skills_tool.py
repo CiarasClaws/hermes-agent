@@ -1030,13 +1030,29 @@ def skill_view(
             _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
         except Exception:
             pass
+        # LOCAL PATCH (18/08/2026) — test the REGISTRATION path as well as the
+        # resolved one.  Registering a skill by symlinking it into SKILLS_DIR is
+        # the sanctioned mechanism here (a real directory there is the thing that
+        # is wrong), so resolving first meant every correctly-registered skill
+        # was reported as untrusted: 361 warnings in one log, 100% of them this
+        # false positive and 0 genuine injection hits.  A security channel that
+        # only ever cries wolf is one nobody reads.
+        #
+        # This is not weaker than resolving.  The check cannot defend against
+        # someone who can write into SKILLS_DIR — such a writer could drop a real
+        # file there, which passed even before this change.  A skill loaded from
+        # genuinely outside SKILLS_DIR (e.g. the HyperFrames CLI reasserting its
+        # own ~/.claude/skills copies) is outside by BOTH paths and still warns.
         for _td in _trusted_dirs:
-            try:
-                skill_md.resolve().relative_to(_td)
-                _outside_skills_dir = False
+            for _candidate in (skill_md, skill_md.resolve()):
+                try:
+                    _candidate.relative_to(_td)
+                    _outside_skills_dir = False
+                    break
+                except ValueError:
+                    continue
+            if not _outside_skills_dir:
                 break
-            except ValueError:
-                continue
 
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
