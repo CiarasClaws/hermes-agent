@@ -1863,8 +1863,47 @@ def cmd_chat(args):
         raise
 
 
+def _register_siginfo_stack_dump():
+    """LOCAL PATCH (re-ported 22/09/2026, originally 6c3bca0b5a on 04/08).
+
+    `kill -INFO <gateway pid>` makes faulthandler write every thread's PYTHON
+    stack to stderr, which launchd routes to ~/.hermes/logs/gateway.error.log.
+    pantheon/scripts/gateway_stall_capture.sh sends that signal the moment a cron
+    turn goes quiet, and its own comments point back at this file.
+
+    Why it is needed: /usr/bin/sample gives NATIVE stacks, and during a confirmed
+    stall they show the process looking idle. That rules things out but cannot name
+    the Python frame, which is the actual question.
+
+    It goes HERE, on the cmd_gateway path, not in gateway/run.py. The LaunchAgent
+    runs `python -m hermes_cli.main gateway run`, so registering in gateway/run.py
+    covers only the `python -m gateway.run` entrypoint and SIGINFO produced nothing.
+
+    THE SIGNAL CHOICE IS LOAD-BEARING. Do not tidy it to SIGUSR1 or SIGUSR2.
+      SIGUSR1 is ALREADY the gateway's restart signal. Registering faulthandler on
+        it is silently overridden, and SENDING it restarts the gateway.
+      SIGUSR2 is free, but its DEFAULT ACTION IS TERMINATE, so if this patch is ever
+        lost the capture script would kill the gateway on every stall it detected.
+      SIGINFO's default action on macOS/BSD is to DISCARD, so a missing handler
+        degrades to "no diagnostics" rather than "gateway killed".
+
+    It has earned its place: as of 22/09/2026 the log holds 575 captured dumps, and
+    566 of them show the main thread idle in selectors.select inside the event loop.
+    That is the finding — nothing is blocked — and only this patch could produce it.
+    """
+    import signal
+    import faulthandler
+    if not hasattr(signal, "SIGINFO"):
+        return  # Linux has no SIGINFO; the capture script is macOS-only anyway.
+    try:
+        faulthandler.register(signal.SIGINFO, all_threads=True, chain=False)
+    except Exception:
+        logger.debug("SIGINFO stack-dump registration failed", exc_info=True)
+
+
 def cmd_gateway(args):
     """Gateway management commands."""
+    _register_siginfo_stack_dump()
     _sync_bundled_skills_quietly()
 
     from hermes_cli.gateway import gateway_command
