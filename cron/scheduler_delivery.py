@@ -1903,6 +1903,47 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+# LOCAL PATCH (re-ported 22/09/2026 from 0.15.1 `cron/scheduler._MAX_DELIVERY_CHARS`).
+#
+# On 16/08/2026 a Daily Reset tick echoed its gate word as "[NO-BLOCK]" instead of the
+# silent marker and then looped 2,427 times, delivering 264,583 characters to Telegram
+# and tripping its flood control. No guard can catch that by CONTENT — the text was
+# individually well-formed every time — so it is bounded by LENGTH instead.
+#
+# Sizing (measured across 1,509 cron runs in the preceding 7 days): the largest
+# legitimate response was 7,049 chars, so 20k leaves roughly 3x headroom.
+#
+# ⚠ TRUNCATE, NEVER DROP. A capped delivery still tells her the job spoke, and silence
+# would be indistinguishable from a job that never ran.
+#
+# ⚠ Upstream bounds CONTEXT (`cron/scheduler_prompt._MAX_CONTEXT_CHARS`, 8000 — what a
+# job's previous output contributes to the next prompt) and has never bounded DELIVERY.
+# They are different failure modes: one protects the model's window, this one protects
+# her messaging client.
+#
+# ⚠ Placed inside `_deliver_result` rather than at its call site, which is where 0.15.1
+# had it. Upstream now reaches delivery from several places — the normal final response,
+# the crash-failure notice, and the durable queue used by restart-safe workers — and a
+# call-site cap would cover one of them. This is the choke point they all pass through.
+_MAX_DELIVERY_CHARS = 20_000
+
+
+def _cap_delivery(job: dict, content: str) -> str:
+    """Bound one delivery. Returns the text to send, truncated with a pointer if oversized."""
+    if len(content) <= _MAX_DELIVERY_CHARS:
+        return content
+    full_len = len(content)
+    logger.warning(
+        "Job '%s': response %d chars exceeds delivery cap %d — truncated for delivery",
+        job.get("id"), full_len, _MAX_DELIVERY_CHARS,
+    )
+    return content[:_MAX_DELIVERY_CHARS] + (
+        f"\n\n⚠️ [truncated: {full_len:,} chars, capped at {_MAX_DELIVERY_CHARS:,}. "
+        f"The untruncated output was saved by save_job_output — see the job's output "
+        f"directory under the cron home, subject to cron.output_retention.]"
+    )
+
+
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1910,6 +1951,7 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    content = _cap_delivery(job, content)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
