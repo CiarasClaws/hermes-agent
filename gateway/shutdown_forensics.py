@@ -124,7 +124,28 @@ def _async_diagnostic_script(signal_name: str, self_pid: int) -> str:
         # ``sort`` instead of GNU ``--sort=-pcpu`` so BSD ps (macOS) produces a listing too; the header
         # line is echoed first so ``sort`` does not bury it among the 0.0-cpu rows.
         "ps -eo pid,ppid,user,pcpu,pmem,stat,comm 2>/dev/null | { IFS= read -r h; echo \"$h\"; sort -nrk4; } | head -60; "
-        f"echo '--- pstree of self ---'; pstree -pl {self_pid} 2>/dev/null | head -40 || true; "
+        # LOCAL PATCH (re-ported 22/09/2026, minimal form of 8a87b44493 from 26/07).
+        # macOS has no pstree, so upstream's line prints nothing here, and the ancestor
+        # chain is the ONE thing this diagnostic exists to capture: the process being
+        # hunted is typically a `launchctl kickstart -k` blocked waiting for us to exit,
+        # which burns no CPU and is cut off by the top-60-by-cpu listing above.
+        #
+        # Tests for pstree with `command -v` rather than relying on `||` after a pipe.
+        # `pstree ... | head -40 || fallback` NEVER runs the fallback, because a pipeline
+        # returns the LAST command's status and head always succeeds. Upstream's `|| true`
+        # hides the same thing harmlessly; here it would have silently produced nothing,
+        # and a first draft of this patch did exactly that until it was run for real.
+        #
+        # Kept to this one probe rather than re-porting the original's 61-line platform
+        # branch: upstream has since fixed the rest (BSD-safe ps, sysctl loadavg fallback,
+        # shutil.which for timeout). Still needed as of 22/09/2026, when a gateway stall
+        # capture fired at 11:55.
+        "echo '--- pstree of self ---'; "
+        f"if command -v pstree >/dev/null 2>&1; then pstree -pl {self_pid} 2>/dev/null | head -40; "
+        f"else p={self_pid}; for _ in 1 2 3 4 5 6 7 8; do "
+        'case "$p" in ""|0) break;; esac; '
+        'ps -o pid=,ppid=,command= -p "$p" 2>/dev/null || break; '
+        'p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); done; fi; '
         "echo '--- loadavg ---'; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null || true; "
         "echo '--- recent dmesg (oom/killed) ---'; "
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
