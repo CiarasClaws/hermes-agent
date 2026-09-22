@@ -219,8 +219,32 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 
 def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
+    # LOCAL PATCH (re-ported 22/09/2026, originally 17d383da6c on 28/07) —
+    # iter_skill_index_files, NOT Path.rglob.
+    #
+    # rglob does not descend into symlinked directories, and in this estate a
+    # registered skill IS a symlink into its source repo: that is the documented
+    # registration pattern, and there are 108 of them in ~/.hermes/skills. So
+    # skill_manage could not see any correctly-registered skill, while skill_view,
+    # skills_list and the prompt snapshot — which already use this walker — saw
+    # them fine.
+    #
+    # The failure was silent and actively misleading: skill_manage returned
+    # "Skill 'X' not found in active profile 'default'", which reads as a
+    # profile-scoping mistake, while skill_view on the same skill in the same run
+    # succeeded. Observed live on 28/07 when a cron retried retinue-counsel four
+    # times and gave up.
+    #
+    # Upstream has since merged the two original call sites into this one helper,
+    # so the single edit now covers both _find_skill and
+    # _find_skill_in_other_profiles. The bug was re-proven on 0.21.4 before this
+    # change: rglob saw 1 of 2 fixture skills, os.walk(followlinks=True) saw both.
+    #
+    # is_excluded_skill_path is kept as well. iter_skill_index_files prunes
+    # excluded dirs itself, but the two exclusion sets are not identical and this
+    # preserves the behaviour the previous code had.
+    from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
+    for skill_md in iter_skill_index_files(root, "SKILL.md"):
         if not is_excluded_skill_path(skill_md):
             yield skill_md.parent
 
