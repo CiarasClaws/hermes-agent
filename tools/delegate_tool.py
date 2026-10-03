@@ -380,17 +380,62 @@ def _build_children(
         "routing_cfg": routing_cfg,
     }
     children = []
+    # LOCAL PATCH (mini-local-overrides; re-ported onto 0.21.5 03/10/2026): per-task model routing.
+    # Upstream gives every child the batch credentials; here each task may run elsewhere — an explicit
+    # per-task model/provider, or the coding/design auto-route to DELEGATE_CODING_MODEL (default
+    # zai/glm-5.2). The decision lives in tools/delegate_tool_local_routing.py. The cache keeps one
+    # credential resolution per (provider, model) per batch; its name is also the marker
+    # ~/.hermes/custom/patches/ensure_delegate_model.sh looks for, so do not rename it.
+    from tools.delegate_tool_local_routing import route_task
+    _per_task_creds_cache: Dict[str, dict] = {}
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        task_creds, task_overrides = creds, overrides
+        _explicit_route = bool(str(t.get("model") or "").strip() or str(t.get("provider") or "").strip())
+        _task_model, _task_provider = route_task(t, i, creds)
+        if _task_model or _task_provider:
+            _cache_key = f"{_task_provider or ''}:{_task_model or ''}"
+            _routed = _per_task_creds_cache.get(_cache_key)
+            if _routed is None:
+                _task_cfg = dict(routing_cfg or {})
+                if _task_model:
+                    _task_cfg["model"] = _task_model
+                if _task_provider:
+                    _task_cfg["provider"] = _task_provider
+                    _task_cfg["base_url"] = ""
+                    _task_cfg["api_key"] = ""
+                try:
+                    _routed = _resolve_delegation_credentials(_task_cfg, parent_agent)
+                except ValueError as exc:
+                    if _explicit_route:
+                        return [], str(exc)  # she named a model: refuse loudly, same as a config pin
+                    # DECISION: an AUTO-route that cannot resolve (plan expired, key missing) must not
+                    # break the delegation — the child runs on the batch credentials instead, and the
+                    # warning below is the alarm. An explicit per-task model still fails loudly above.
+                    logger.warning(
+                        "delegate_task: coding auto-route to %s/%s could not resolve (%s) — subtask %d "
+                        "runs on the batch model instead", _task_provider, _task_model, exc, i)
+                    _routed = creds
+                _per_task_creds_cache[_cache_key] = _routed
+            if _routed is not creds:
+                task_creds = _routed
+                task_overrides = {
+                    **overrides,
+                    "override_provider": task_creds["provider"], "override_base_url": task_creds["base_url"],
+                    "override_api_key": task_creds["api_key"], "override_api_mode": task_creds["api_mode"],
+                    "override_request_overrides": task_creds.get("request_overrides"),
+                    "override_acp_command": task_creds.get("command"),
+                    "override_acp_args": task_creds.get("args"),
+                }
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **task_overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -590,7 +635,14 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml.\n"
+    # LOCAL PATCH (mini-local-overrides): the model guidance carried over from the 0.15.1 override.
+    "- CHOOSING THE SUBAGENT MODEL (optional per-task 'model'/'provider'): leave them unset for ordinary "
+    "subtasks — the main model is the right default for research, synthesis, review and most delegation. "
+    "For COMPLEX, LONG-HORIZON CODING (multi-file implementation, refactors, debugging across a codebase) or "
+    "FRONTEND/UI DESIGN THAT PRODUCES CODE (components, layouts, CSS, Shopify themes), set model='glm-5.2', "
+    "provider='zai'; clear coding/design goals are auto-routed there even when unset. Do NOT use it for "
+    "brand-voice or editorial copy, cheap mechanical tasks, or plain research."
 )
 
 def _build_tasks_param_description() -> str:
@@ -669,6 +721,17 @@ DELEGATE_TASK_SCHEMA = {
                             "child up front; parent validates with one bounded correction retry; result gains "
                             "schema_valid, plus schema_errors on failure — the child's raw text is still returned "
                             "as summary, never discarded). Keep it forgiving — require only fields you will read.",
+                        ),
+                        # LOCAL PATCH (mini-local-overrides): per-task model routing, see _build_children.
+                        "model": _p(
+                            "string",
+                            "Optional per-task model override (e.g. 'glm-5.2'). Leave unset for ordinary "
+                            "subtasks; coding and frontend-design goals are auto-routed. Say 'use deepseek' "
+                            "in the goal to keep a task on the main model.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional per-task provider for 'model' (e.g. 'zai'). Only with 'model'.",
                         ),
                         "images": _p(
                             "array",
