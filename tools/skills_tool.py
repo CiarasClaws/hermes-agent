@@ -562,7 +562,16 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
     with suppress(Exception):
         trusted_dirs.extend(d.resolve() for d in all_dirs)
     warnings = []
-    if not _under_any(skill_md, trusted_dirs):
+    # LOCAL PATCH (18/08/2026, re-ported onto 0.21.5 03/10/2026): test the REGISTRATION path as
+    # well as the resolved one. Registering a skill by symlinking it into the skills dir is the
+    # sanctioned mechanism on this host, so a resolved-only test reported every correctly
+    # registered skill as untrusted (361 warnings in one log, all this false positive, 0 real
+    # hits). This is not weaker: a writer who can place a symlink in a trusted dir could place a
+    # real file there, which passed already; a skill loaded from genuinely outside every trusted
+    # dir is outside by BOTH paths and still warns.
+    _lexical_dirs = [active_skills_dir, *all_dirs]
+    _registered = any(Path(skill_md).is_relative_to(d) for d in _lexical_dirs)
+    if not _registered and not _under_any(skill_md, trusted_dirs):
         warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
         warnings.append("skill content contains patterns that may indicate prompt injection")
