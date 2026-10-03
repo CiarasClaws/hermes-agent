@@ -27,6 +27,13 @@ from tools.delegate_tool_child_run import (  # noqa: F401
     _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
+# LOCAL PATCH (mini-local-overrides): the routing decision lives in delegate_tool_local_routing, and its
+# names are re-exported HERE on purpose. The Hermes Exam's glm-route-live scenario
+# (pantheon/oracle/exam/checks.py) inspects and imports THIS module and calls _looks_like_coding_task, so
+# these imports keep that alarm testing the real functions. Do not remove them.
+from tools.delegate_tool_local_routing import (  # noqa: F401
+    _CODING_SIGNAL_RE, _coding_autoroute_target, _looks_like_coding_task, _prefers_main_model, route_task,
+)
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
@@ -386,7 +393,6 @@ def _build_children(
     # zai/glm-5.2). The decision lives in tools/delegate_tool_local_routing.py. The cache keeps one
     # credential resolution per (provider, model) per batch; its name is also the marker
     # ~/.hermes/custom/patches/ensure_delegate_model.sh looks for, so do not rename it.
-    from tools.delegate_tool_local_routing import route_task
     _per_task_creds_cache: Dict[str, dict] = {}
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
