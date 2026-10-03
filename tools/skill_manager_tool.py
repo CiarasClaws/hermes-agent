@@ -219,8 +219,14 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 
 def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
+    # LOCAL PATCH (28/07/2026, re-ported onto 0.21.5 03/10/2026): iter_skill_index_files, not
+    # Path.rglob. rglob does NOT descend into symlinked directories, and on this host a registered
+    # skill IS a symlink into its source repo, so rglob made every correctly-registered skill
+    # (about 50 of them) invisible to skill_manage while skill_view/skills_list, which already
+    # use this walker, saw them fine. The symptom was a silent "Skill 'X' not found".
+    from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
+    for skill_md in iter_skill_index_files(root, "SKILL.md"):
+        skill_md = Path(skill_md)
         if not is_excluded_skill_path(skill_md):
             yield skill_md.parent
 
