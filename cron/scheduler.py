@@ -355,6 +355,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
 
 DEFAULT_FAILURE_REPEAT_ALERT_HOURS = 6.0
 
+# LOCAL PATCH (16/08/2026): see the delivery cap in the run-delivery path. Across 1,509 cron runs the
+# largest legitimate response was 7,049 chars, so 20k leaves about 3x headroom.
+_MAX_DELIVERY_CHARS = 20_000
+
 
 def _failure_repeat_alert_hours() -> float:
     """``cron.failure_repeat_alert_hours``: how long an ``alerted`` incident stays silent before one
@@ -2998,6 +3002,18 @@ def _save_compose_deliver(
 
     if not d.should_deliver:
         return
+    # LOCAL PATCH (16/08/2026, re-ported onto 0.21.5 03/10/2026): hard ceiling on what one job may
+    # deliver. The silence guard above matches only its marker, so any other output is delivered in
+    # full at any length. On 16/08 a job looped 2,427 times and delivered 264,583 chars to Telegram,
+    # tripping flood control. No guard can catch that by content, so bound it by length. Truncate,
+    # never drop: a capped delivery still says the job spoke, and the full output is already saved.
+    if len(deliver_content) > _MAX_DELIVERY_CHARS:
+        _full_len = len(deliver_content)
+        deliver_content = deliver_content[:_MAX_DELIVERY_CHARS] + (
+            f"\n\n⚠️ [truncated: {_full_len:,} chars, capped at {_MAX_DELIVERY_CHARS:,} — "
+            f"full output in ~/.hermes/cron/output/{job['id']}/]")
+        logger.warning("Job '%s': response %d chars exceeds cap %d — truncated for delivery",
+                       job["id"], _full_len, _MAX_DELIVERY_CHARS)
     d.unresolved_origin = (
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
         and not _resolve_delivery_targets(job, for_failure=not d.success)
