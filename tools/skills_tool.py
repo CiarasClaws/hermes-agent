@@ -569,8 +569,12 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
     # hits). This is not weaker: a writer who can place a symlink in a trusted dir could place a
     # real file there, which passed already; a skill loaded from genuinely outside every trusted
     # dir is outside by BOTH paths and still warns.
+    # Narrowed on the re-port: only DIRECTORY-level registration counts (the skill dir is the
+    # symlink, SKILL.md inside it a regular file). A SKILL.md that is ITSELF a symlink to a file
+    # outside every root is the case upstream guards against, so it still warns.
     _lexical_dirs = [active_skills_dir, *all_dirs]
-    _registered = any(Path(skill_md).is_relative_to(d) for d in _lexical_dirs)
+    _registered = (not Path(skill_md).is_symlink()
+                   and any(Path(skill_md).is_relative_to(d) for d in _lexical_dirs))
     if not _registered and not _under_any(skill_md, trusted_dirs):
         warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
