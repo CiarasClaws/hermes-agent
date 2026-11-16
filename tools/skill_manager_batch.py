@@ -144,7 +144,15 @@ def _snapshot_skills(names, snap_root, find_skill):
     return snapshots, None
 
 
+def _through_link(p):
+    """A skill dir reached through a symlink is restored INSIDE its target. Renaming the
+    link aside and copytree-ing into its place would replace the link with a real
+    directory (and leave the link behind as a second skill of the same name)."""
+    return p.resolve() if p is not None and p.is_symlink() else p
+
+
 def _restore_snapshot(pre_dir, snap, post_dir) -> None:
+    pre_dir, post_dir = _through_link(pre_dir), _through_link(post_dir)
     post_exists = post_dir is not None and post_dir.is_dir()
     if snap is None:
         if post_exists:  # Batch created this skill: remove the partial result.
