@@ -223,6 +223,35 @@ class TestSkillManageBatch(unittest.TestCase):
         content = open(skill_md).read()
         self.assertIn("Step ONE.", content)
 
+    def test_rollback_keeps_a_symlinked_skill_a_symlink(self):
+        """A skill reached through a symlinked directory (the estate links its ritual
+        skills into skills/<category>/ from a git repo) must still be that symlink after
+        a failed batch rolls back. Rollback used to rename the LINK aside as
+        `<name>.rollback-broken` and copytree the snapshot into its place, turning the
+        link into a real directory: later repo edits never reached the agent, and the
+        leftover link (rmtree refuses symlinks, ignore_errors hid it) made a second
+        skill of the same name. Happened twice live (17/10 and 15/11/2026)."""
+        real = os.path.join(self.home, "repo", "probe")
+        os.makedirs(real)
+        with open(os.path.join(real, "SKILL.md"), "w") as f:
+            f.write(SK.format(n="probe"))
+        cat = os.path.join(self.home, "skills", "productivity")
+        os.makedirs(cat)
+        link = os.path.join(cat, "probe")
+        os.symlink(real, link)
+        r = self._call("probe", [
+            {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+            {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+        ])
+        self.assertFalse(r["success"], r)
+        self.assertTrue(os.path.islink(link), "rollback replaced the symlink with a directory")
+        self.assertEqual(os.path.realpath(link), os.path.realpath(real))
+        self.assertEqual(sorted(os.listdir(cat)), ["probe"], "rollback left debris beside the skill")
+        self.assertEqual(sorted(os.listdir(os.path.dirname(real))), ["probe"])
+        content = open(os.path.join(real, "SKILL.md")).read()
+        self.assertIn("Step 1.", content)       # the target itself was rolled back
+        self.assertNotIn("Step ONE.", content)
+
     def test_single_op_path_unchanged(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         raw = self.smt.skill_manage(
